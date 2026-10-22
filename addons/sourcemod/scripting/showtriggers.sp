@@ -31,6 +31,16 @@
                         FL_EDICT_PVSCHECK)
 #define ALPHA_MASK     0xFF000000 // m_clrRender is RGBA from the low byte
 
+// Stand-ins are created only while this many edicts stay free...
+#define STANDIN_CREATE_MARGIN  288
+// ...and all of them are removed once fewer than this many stay free.
+#define STANDIN_RELEASE_MARGIN 192
+// Room between the two lines for one map's stand-ins (64 on kz_dontjump).
+#assert STANDIN_CREATE_MARGIN - STANDIN_RELEASE_MARGIN >= 96
+
+#define LIMIT_NOTE \
+    "Some triggers aren't shown: the server is near its entity limit."
+
 #if !defined PLUGIN_VERSION
 #define PLUGIN_VERSION "dev"
 #endif
@@ -43,16 +53,36 @@ public Plugin myinfo = {
     url = "https://github.com/misscatmint/sm-showtriggers/"
 };
 
+// Read at their C++ sizes: int, color32, unsigned short, unsigned char.
+int g_iEffectsOffset;
+int g_iRenderColorOffset;
+int g_iSolidFlagsOffset;
+int g_iSolidTypeOffset;
+
 bool g_bShowing[MAXPLAYERS + 1];
 int g_iViewers;
 ArrayList g_hShown;    // trigger reference, saved m_clrRender
 ArrayList g_hStandIns; // stand-in reference, trigger reference
+int g_iEdicts;         // edicts in use, kept only while active
+bool g_bStandInsReleased;
+bool g_bLimitNoted;
 
 public void OnPluginStart() {
+    g_iEffectsOffset = FindEntityProp("m_fEffects");
+    g_iRenderColorOffset = FindEntityProp("m_clrRender");
+    g_iSolidFlagsOffset = FindEntityProp("m_usSolidFlags");
+    g_iSolidTypeOffset = FindEntityProp("m_nSolidType");
     g_hShown = new ArrayList(2);
     g_hStandIns = new ArrayList(2);
     RegConsoleCmd("sm_showtriggers", Command_ShowTriggers,
                   "Toggles showing trigger brushes for you");
+}
+
+int FindEntityProp(const char[] prop) {
+    int offset = FindSendPropInfo("CBaseEntity", prop);
+    if (offset <= 0)
+        SetFailState("Couldn't find CBaseEntity's %s", prop);
+    return offset;
 }
 
 public void OnPluginEnd() {
@@ -78,10 +108,14 @@ Action Command_ShowTriggers(int client, int args) {
         return Plugin_Handled;
     }
 
-    SetShowing(client, !g_bShowing[client]);
-    PrintToChat(client, (g_bShowing[client]
-                            ? "Showing trigger brushes."
-                            : "Stopped showing trigger brushes."));
+    bool show = !g_bShowing[client];
+    PrintToChat(client, (show ? "Showing trigger brushes."
+                              : "Stopped showing trigger brushes."));
+    bool noted = g_bLimitNoted;
+    SetShowing(client, show);
+    // Viewers who turn it on after the note was sent get it too.
+    if (show && noted)
+        PrintToChat(client, LIMIT_NOTE);
     return Plugin_Handled;
 }
 
@@ -95,11 +129,22 @@ void SetShowing(int client, bool show) {
 }
 
 void Activate() {
+    // Player slots are never given to other entities, filled or not.
+    g_iEdicts = MaxClients + 1;
+    ArrayList triggers = new ArrayList();
     int maxEntities = GetMaxEntities();
     for (int entity = MaxClients + 1; entity < maxEntities; ++entity) {
-        if (IsValidEdict(entity))
-            ShowIfTrigger(entity);
+        if (!IsValidEdict(entity))
+            continue;
+        ++g_iEdicts;
+        if (IsHiddenTrigger(entity))
+            triggers.Push(entity);
     }
+
+    // After counting, so the loop never meets a new stand-in.
+    for (int i = 0; i < triggers.Length; ++i)
+        ShowTrigger(triggers.Get(i));
+    delete triggers;
 }
 
 void Deactivate() {
@@ -109,18 +154,22 @@ void Deactivate() {
             Hide(entity, g_hShown.Get(i, 1));
     }
     g_hShown.Clear();
-
-    for (int i = 0; i < g_hStandIns.Length; ++i) {
-        int standIn = EntRefToEntIndex(g_hStandIns.Get(i));
-        if (standIn != INVALID_ENT_REFERENCE)
-            RemoveEntity(standIn);
-    }
-    g_hStandIns.Clear();
+    RemoveStandIns();
+    g_bStandInsReleased = false;
+    g_bLimitNoted = false;
 }
 
 public void OnEntityCreated(int entity, const char[] classname) {
     if (g_iViewers == 0 || entity <= MaxClients || entity >= GetMaxEntities())
         return;
+
+    ++g_iEdicts;
+    if (g_hStandIns.Length > 0 &&
+        g_iEdicts >= GetMaxEntities() - STANDIN_RELEASE_MARGIN) {
+        RemoveStandIns();
+        g_bStandInsReleased = true;
+        NoteLimit();
+    }
 
     // Solid flags and the model are only set during spawn.
     SDKHook(entity, SDKHook_SpawnPost, OnTriggerSpawnPost);
@@ -128,14 +177,15 @@ public void OnEntityCreated(int entity, const char[] classname) {
 
 void OnTriggerSpawnPost(int entity) {
     SDKUnhook(entity, SDKHook_SpawnPost, OnTriggerSpawnPost);
-    if (g_iViewers > 0 && IsValidEdict(entity))
-        ShowIfTrigger(entity);
+    if (g_iViewers > 0 && IsValidEdict(entity) && IsHiddenTrigger(entity))
+        ShowTrigger(entity);
 }
 
 public void OnEntityDestroyed(int entity) {
-    if (g_iViewers == 0 || entity <= MaxClients)
+    if (g_iViewers == 0 || entity <= MaxClients || entity >= GetMaxEntities())
         return;
 
+    --g_iEdicts;
     // Round restarts keep func_illusionary but rebuild most triggers.
     int index = g_hStandIns.FindValue(EntIndexToEntRef(entity), 1);
     if (index == -1)
@@ -147,10 +197,27 @@ public void OnEntityDestroyed(int entity) {
     g_hStandIns.Erase(index);
 }
 
-void ShowIfTrigger(int entity) {
-    if (!IsHiddenTrigger(entity))
-        return;
+bool IsHiddenTrigger(int entity) {
+    if (!(GetEntData(entity, g_iEffectsOffset) & EF_NODRAW))
+        return false;
 
+    // Box solids don't collide with their model, so it's the wrong shape.
+    int solidType = GetEntData(entity, g_iSolidTypeOffset, 1);
+    if (solidType != SOLID_BSP && solidType != SOLID_VPHYSICS)
+        return false;
+
+    // Disabled triggers drop FSOLID_TRIGGER but keep CBaseTrigger's fields.
+    if (!(GetEntData(entity, g_iSolidFlagsOffset, 2) & FSOLID_TRIGGER) &&
+        !HasEntProp(entity, Prop_Data, "m_hTouchingEntities")) {
+        return false;
+    }
+
+    char model[2];
+    GetEntPropString(entity, Prop_Data, "m_ModelName", model, sizeof(model));
+    return model[0] == '*';
+}
+
+void ShowTrigger(int entity) {
     // Filtering a trigger clients already get would break it for others.
     if (GetEdictFlags(entity) & FL_EDICT_DONTSEND)
         Show(entity);
@@ -158,38 +225,15 @@ void ShowIfTrigger(int entity) {
         AddStandIn(entity);
 }
 
-bool IsHiddenTrigger(int entity) {
-    if (!HasEntProp(entity, Prop_Send, "m_usSolidFlags"))
-        return false;
-
-    // Disabled triggers drop FSOLID_TRIGGER but keep CBaseTrigger's fields.
-    if (!(GetEntProp(entity, Prop_Send, "m_usSolidFlags") & FSOLID_TRIGGER) &&
-        !HasEntProp(entity, Prop_Data, "m_hTouchingEntities")) {
-        return false;
-    }
-
-    // Box solids don't collide with their model, so it's the wrong shape.
-    int solidType = GetEntProp(entity, Prop_Send, "m_nSolidType");
-    if (solidType != SOLID_BSP && solidType != SOLID_VPHYSICS)
-        return false;
-
-    if (!(GetEntProp(entity, Prop_Send, "m_fEffects") & EF_NODRAW))
-        return false;
-
-    char model[2];
-    GetEntPropString(entity, Prop_Data, "m_ModelName", model, sizeof(model));
-    return model[0] == '*';
-}
-
 void Show(int entity) {
-    SetEntProp(entity, Prop_Send, "m_fEffects",
-               GetEntProp(entity, Prop_Send, "m_fEffects") & ~EF_NODRAW);
+    SetEntData(entity, g_iEffectsOffset,
+               GetEntData(entity, g_iEffectsOffset) & ~EF_NODRAW, 4, true);
     // A raw m_fEffects write skips the recompute RemoveEffects would do.
     SetEdictFlags(entity, ((GetEdictFlags(entity) & ~TRANSMIT_BITS) |
                            FL_EDICT_PVSCHECK |
                            FL_EDICT_DIRTY_PVS_INFORMATION));
-    int color = GetEntProp(entity, Prop_Send, "m_clrRender");
-    SetEntProp(entity, Prop_Send, "m_clrRender", color & ALPHA_MASK);
+    int color = GetEntData(entity, g_iRenderColorOffset);
+    SetEntData(entity, g_iRenderColorOffset, color & ALPHA_MASK, 4, true);
     SDKHook(entity, SDKHook_SetTransmit, OnTriggerTransmit);
     int index = g_hShown.Push(EntIndexToEntRef(entity));
     g_hShown.Set(index, color, 1);
@@ -197,10 +241,10 @@ void Show(int entity) {
 
 void Hide(int entity, int color) {
     SDKUnhook(entity, SDKHook_SetTransmit, OnTriggerTransmit);
-    SetEntProp(entity, Prop_Send, "m_clrRender", color);
+    SetEntData(entity, g_iRenderColorOffset, color, 4, true);
     // Shown triggers had both flags; the engine keeps a parent networked.
-    SetEntProp(entity, Prop_Send, "m_fEffects",
-               GetEntProp(entity, Prop_Send, "m_fEffects") | EF_NODRAW);
+    SetEntData(entity, g_iEffectsOffset,
+               GetEntData(entity, g_iEffectsOffset) | EF_NODRAW, 4, true);
     int transmit = GetEntPropEnt(entity, Prop_Data, "m_hMoveChild") == -1
                        ? FL_EDICT_DONTSEND
                        : FL_EDICT_PVSCHECK;
@@ -208,6 +252,12 @@ void Hide(int entity, int color) {
 }
 
 void AddStandIn(int trigger) {
+    if (g_bStandInsReleased ||
+        g_iEdicts + 1 > GetMaxEntities() - STANDIN_CREATE_MARGIN) {
+        NoteLimit();
+        return;
+    }
+
     int standIn = CreateEntityByName("func_illusionary");
     if (standIn == -1)
         return;
@@ -223,8 +273,9 @@ void AddStandIn(int trigger) {
     ActivateEntity(standIn);
     // Spawn zeroes the angles.
     TeleportEntity(standIn, NULL_VECTOR, angles, NULL_VECTOR);
-    SetEntProp(standIn, Prop_Send, "m_clrRender",
-               GetEntProp(standIn, Prop_Send, "m_clrRender") & ALPHA_MASK);
+    SetEntData(standIn, g_iRenderColorOffset,
+               GetEntData(standIn, g_iRenderColorOffset) & ALPHA_MASK, 4,
+               true);
     // A child keeps its parent networked, harmless since this one already is.
     if (GetEntPropEnt(trigger, Prop_Data, "m_hMoveParent") != -1) {
         SetVariantString("!activator");
@@ -233,6 +284,26 @@ void AddStandIn(int trigger) {
     SDKHook(standIn, SDKHook_SetTransmit, OnTriggerTransmit);
     int index = g_hStandIns.Push(EntIndexToEntRef(standIn));
     g_hStandIns.Set(index, EntIndexToEntRef(trigger), 1);
+}
+
+void RemoveStandIns() {
+    for (int i = 0; i < g_hStandIns.Length; ++i) {
+        int standIn = EntRefToEntIndex(g_hStandIns.Get(i));
+        if (standIn != INVALID_ENT_REFERENCE)
+            RemoveEntity(standIn);
+    }
+    g_hStandIns.Clear();
+}
+
+void NoteLimit() {
+    if (g_bLimitNoted)
+        return;
+
+    g_bLimitNoted = true;
+    for (int client = 1; client <= MaxClients; ++client) {
+        if (g_bShowing[client])
+            PrintToChat(client, LIMIT_NOTE);
+    }
 }
 
 Action OnTriggerTransmit(int entity, int client) {

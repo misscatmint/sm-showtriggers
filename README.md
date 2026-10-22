@@ -61,6 +61,25 @@ black and sent only to players with the view on.
 - A stand-in is removed with its trigger, so a round restart that rebuilds the
   triggers leaves one stand-in per trigger.
 
+### Entity limit
+
+A Source server crashes when it runs out of edicts, so stand-ins never take
+the last ones. While the view is on, the plugin keeps a live count of edicts
+in use (player slots included) and:
+
+- creates a stand-in only while at least `STANDIN_CREATE_MARGIN` (288) edicts
+  would stay free,
+- removes every stand-in once fewer than `STANDIN_RELEASE_MARGIN` (192) are
+  free, for example when players join or the map spawns entities, and keeps
+  them off until the view is next turned on by the first viewer,
+- tells viewers once: "Some triggers aren't shown: the server is near its
+  entity limit."
+
+Both are margins below the engine's edict limit (`GetMaxEntities()`, 2048 in
+CS:GO), set as constants at the top of `showtriggers.sp`. The gap between them
+has to stay at least 96, which the compiler checks. Triggers shown without a
+stand-in take no edicts and aren't affected.
+
 ## License
 
 AGPL-3.0, see `LICENSE.txt`.
