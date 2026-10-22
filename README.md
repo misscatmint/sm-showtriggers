@@ -40,10 +40,10 @@ It isn't shown when:
 - its brush has no visible faces, for example a trigger built from a texture
   the compiler strips.
 
-Shown triggers are tinted black. The trigger texture's color is multiplied by
-the map's baked light, so lit triggers would glow orange while shadowed ones
-draw as a dark box with readable "TRIGGER" text. Black makes every trigger
-look like the shadowed ones.
+Shown triggers are tinted black. Drawn as is, the trigger texture's orange
+changes with the surroundings and the viewpoint, and glows in some spots. In
+black, every trigger draws the same way: a dark translucent box with readable
+"TRIGGER" text.
 
 ### Triggers clients already receive
 
