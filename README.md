@@ -47,12 +47,19 @@ black, every trigger draws the same way: a dark translucent box with readable
 
 ### Triggers clients already receive
 
-Some hidden triggers are sent to every client anyway, for example a trigger
-something is parented to, or CS:GO's client-predicted `trigger_playermovement`
-(auto-duck, auto-walk or disable jump). Showing one only to some players would
-break it for the others, so the plugin leaves it untouched and draws a
-stand-in in its place: a `func_illusionary` with the trigger's brush, tinted
-black and sent only to players with the view on.
+Most triggers are never sent to clients, so the plugin can send them to
+viewers alone. A few are sent to every client anyway, because clients use
+them: CS:GO's client-predicted `trigger_playermovement` (auto-duck, auto-walk
+or disable jump), and triggers that something is parented to.
+
+Sending one of those only to viewers would take it away from everyone else:
+their movement prediction in those zones would differ from the stock game's
+(more mispredicted jumps and rubber-banding, though the server's results don't
+change). Older showtriggers plugins do this, and also leave those triggers
+unsent for everyone after the view is turned off, until the next round restart
+or map change. This plugin leaves them untouched and draws a stand-in in their
+place instead: a `func_illusionary` with the trigger's brush sent only to
+players with the view on.
 
 - Each stand-in takes one edict while the view is on.
 - A stand-in for a trigger that moves with a parent is parented to the trigger
@@ -63,9 +70,9 @@ black and sent only to players with the view on.
 
 ### Entity limit
 
-A Source server crashes when it runs out of edicts, so stand-ins never take
-the last ones. While the view is on, the plugin keeps a live count of edicts
-in use (player slots included) and:
+A Source server crashes when it runs out of edicts, so stand-ins never use up
+the last free edict slots. While the view is on, the plugin keeps a live count
+of edicts in use (player slots included) and:
 
 - creates a stand-in only while at least `STANDIN_CREATE_MARGIN` (288) edicts
   would stay free,
