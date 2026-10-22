@@ -35,7 +35,8 @@
 #define STANDIN_CREATE_MARGIN  288
 // ...and all of them are removed once fewer than this many stay free.
 #define STANDIN_RELEASE_MARGIN 192
-// Room between the two lines for one map's stand-ins (64 on kz_dontjump).
+// Room between the two lines for one map's stand-ins (64 on the busiest map
+// tested).
 #assert STANDIN_CREATE_MARGIN - STANDIN_RELEASE_MARGIN >= 96
 
 #define LIMIT_NOTE \
@@ -64,7 +65,8 @@ int g_iViewers;
 ArrayList g_hShown;    // trigger reference, saved m_clrRender
 ArrayList g_hStandIns; // stand-in reference, trigger reference
 int g_iEdicts;         // edicts in use, kept only while active
-bool g_bStandInsReleased;
+// Two flags: a skipped stand-in sends the note but doesn't stop later ones.
+bool g_bStandInsReleased; // no new stand-ins until the next activation
 bool g_bLimitNoted;
 
 public void OnPluginStart() {
@@ -86,15 +88,7 @@ int FindEntityProp(const char[] prop) {
 }
 
 public void OnPluginEnd() {
-    if (g_iViewers > 0)
-        Deactivate();
-}
-
-public void OnMapEnd() {
-    for (int client = 1; client <= MaxClients; ++client) {
-        if (g_bShowing[client])
-            SetShowing(client, false);
-    }
+    Deactivate();
 }
 
 public void OnClientDisconnect(int client) {
@@ -111,10 +105,9 @@ Action Command_ShowTriggers(int client, int args) {
     bool show = !g_bShowing[client];
     PrintToChat(client, (show ? "Showing trigger brushes."
                               : "Stopped showing trigger brushes."));
-    bool noted = g_bLimitNoted;
     SetShowing(client, show);
-    // Viewers who turn it on after the note was sent get it too.
-    if (show && noted)
+    // The first viewer already got the note from NoteLimit() on activation.
+    if (show && g_bLimitNoted && g_iViewers > 1)
         PrintToChat(client, LIMIT_NOTE);
     return Plugin_Handled;
 }
@@ -141,7 +134,7 @@ void Activate() {
             triggers.Push(entity);
     }
 
-    // After counting, so the loop never meets a new stand-in.
+    // Stand-ins come after counting, or the loop would count new ones twice.
     for (int i = 0; i < triggers.Length; ++i)
         ShowTrigger(triggers.Get(i));
     delete triggers;
@@ -151,7 +144,7 @@ void Deactivate() {
     for (int i = 0; i < g_hShown.Length; ++i) {
         int entity = EntRefToEntIndex(g_hShown.Get(i));
         if (entity != INVALID_ENT_REFERENCE)
-            Hide(entity, g_hShown.Get(i, 1));
+            HideFromViewers(entity, g_hShown.Get(i, 1));
     }
     g_hShown.Clear();
     RemoveStandIns();
@@ -172,11 +165,11 @@ public void OnEntityCreated(int entity, const char[] classname) {
     }
 
     // Solid flags and the model are only set during spawn.
-    SDKHook(entity, SDKHook_SpawnPost, OnTriggerSpawnPost);
+    SDKHook(entity, SDKHook_SpawnPost, OnEntitySpawnPost);
 }
 
-void OnTriggerSpawnPost(int entity) {
-    SDKUnhook(entity, SDKHook_SpawnPost, OnTriggerSpawnPost);
+void OnEntitySpawnPost(int entity) {
+    SDKUnhook(entity, SDKHook_SpawnPost, OnEntitySpawnPost);
     if (g_iViewers > 0 && IsValidEdict(entity) && IsHiddenTrigger(entity))
         ShowTrigger(entity);
 }
@@ -218,28 +211,28 @@ bool IsHiddenTrigger(int entity) {
 }
 
 void ShowTrigger(int entity) {
-    // Filtering a trigger clients already get would break it for others.
+    // Filtering a trigger clients already get would change it for others.
     if (GetEdictFlags(entity) & FL_EDICT_DONTSEND)
-        Show(entity);
+        ShowToViewers(entity);
     else
         AddStandIn(entity);
 }
 
-void Show(int entity) {
+void ShowToViewers(int entity) {
     SetEntData(entity, g_iEffectsOffset,
                GetEntData(entity, g_iEffectsOffset) & ~EF_NODRAW, 4, true);
-    // A raw m_fEffects write skips the recompute RemoveEffects would do.
+    // A raw m_fEffects write skips what RemoveEffects would do: recompute the
+    // transmit state and mark the PVS information dirty.
     SetEdictFlags(entity, ((GetEdictFlags(entity) & ~TRANSMIT_BITS) |
                            FL_EDICT_PVSCHECK |
                            FL_EDICT_DIRTY_PVS_INFORMATION));
-    int color = GetEntData(entity, g_iRenderColorOffset);
-    SetEntData(entity, g_iRenderColorOffset, color & ALPHA_MASK, 4, true);
+    int color = TintBlack(entity);
     SDKHook(entity, SDKHook_SetTransmit, OnTriggerTransmit);
     int index = g_hShown.Push(EntIndexToEntRef(entity));
     g_hShown.Set(index, color, 1);
 }
 
-void Hide(int entity, int color) {
+void HideFromViewers(int entity, int color) {
     SDKUnhook(entity, SDKHook_SetTransmit, OnTriggerTransmit);
     SetEntData(entity, g_iRenderColorOffset, color, 4, true);
     // Shown triggers had both flags; the engine keeps a parent networked.
@@ -273,9 +266,7 @@ void AddStandIn(int trigger) {
     ActivateEntity(standIn);
     // Spawn zeroes the angles.
     TeleportEntity(standIn, NULL_VECTOR, angles, NULL_VECTOR);
-    SetEntData(standIn, g_iRenderColorOffset,
-               GetEntData(standIn, g_iRenderColorOffset) & ALPHA_MASK, 4,
-               true);
+    TintBlack(standIn);
     // A child keeps its parent networked, harmless since this one already is.
     if (GetEntPropEnt(trigger, Prop_Data, "m_hMoveParent") != -1) {
         SetVariantString("!activator");
@@ -284,6 +275,13 @@ void AddStandIn(int trigger) {
     SDKHook(standIn, SDKHook_SetTransmit, OnTriggerTransmit);
     int index = g_hStandIns.Push(EntIndexToEntRef(standIn));
     g_hStandIns.Set(index, EntIndexToEntRef(trigger), 1);
+}
+
+// Returns the color it replaced.
+int TintBlack(int entity) {
+    int color = GetEntData(entity, g_iRenderColorOffset);
+    SetEntData(entity, g_iRenderColorOffset, color & ALPHA_MASK, 4, true);
+    return color;
 }
 
 void RemoveStandIns() {
