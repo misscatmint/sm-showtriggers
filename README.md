@@ -3,6 +3,22 @@
 A SourceMod plugin that lets players see the map's trigger brushes, drawn with
 the texture the mapper gave them (usually the "TRIGGER" tool texture).
 
+A from-scratch replacement for older showtriggers plugins, which:
+
+- change other players' movement prediction in CS:GO's no-jump, auto-walk and
+  auto-duck zones while anyone has the view on, and for everyone after it's
+  turned off, until the next round restart or map change,
+- stop showing triggers to viewers after a round restart,
+- leave triggers visible to every player if the plugin is unloaded while in
+  use,
+- draw zones that other plugins build from a map brush in the brush's shape
+  instead of the zone's real one,
+- miss triggers whose class name doesn't start with `trigger`, such as CS:GO's
+  buy and bomb zones or TF2's respawn rooms.
+
+This plugin does none of that, and draws triggers in a uniform dark tint
+instead of the texture's uneven orange glow.
+
 ## Usage
 
 `sm_showtriggers` toggles the view for the player who runs it.
