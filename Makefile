@@ -20,10 +20,15 @@ $(PLUGINS):
 DIST_NAME := sm-showtriggers
 DIST := dist
 TREE := $(DIST)/tree
-COMMIT_TIME = $(shell TZ=UTC git log -1 --date=format-local:$(1) --format=%cd)
-VERSION = $(or $(patsubst v%,%,$(shell git describe --tags --exact-match \
-	--match 'v*' 2>/dev/null)),dev-$(shell git rev-parse HEAD | cut -c1-8))$(if \
-	$(shell git status --porcelain -- addons LICENSE.txt README.md),-dirty)
+# Plumbing commands only, since porcelain output changes with git config.
+COMMIT_TIME = $(shell TZ=UTC git rev-list -1 --no-commit-header \
+	--date=format-local:$(1) --format=%cd HEAD)
+VERSION = $(or $(patsubst v%,%,$(shell git for-each-ref --points-at=HEAD \
+	--sort=-version:refname --count=1 --format='%(refname:lstrip=2)' \
+	'refs/tags/v*')),dev-$(shell git rev-parse HEAD | cut -c1-8))$(if \
+	$(shell git update-index -q --refresh; \
+	git diff-index --name-only HEAD -- addons LICENSE.txt README.md; \
+	git ls-files --others --exclude-standard -- addons LICENSE.txt README.md),-dirty)
 
 dist:
 	@git rev-parse -q --verify HEAD >/dev/null || { echo "make dist" \
